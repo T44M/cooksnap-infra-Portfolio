@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Cooksnap - LINE Bot
+
+Parameters:
+  Environment:
+    Type: String
+    Description: Environment name (e.g. dev, prod)
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+
+Globals:
+  Function:
+    Timeout: 29
+    Runtime: python3.9
+    MemorySize: 256
+    Environment:
+      Variables:
+        PYTHONDONTWRITEBYTECODE: 1  
+        PYTHONPATH: /opt/python:/var/task:/opt/python/cooksnap
+
+Resources:
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub cooksnap-users-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: referral_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: referral_code-index
+          KeySchema:
+            - AttributeName: referral_code
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+  
+  RecipesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub cooksnap-recipes-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recipe_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: recipe_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-created_at-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+  
+  SharesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub cooksnap-shares-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: share_id
+          AttributeType: S
+        - AttributeName: recipe_id
+          AttributeType: S
+        - AttributeName: short_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: share_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: recipe_id-index
+          KeySchema:
+            - AttributeName: recipe_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: short_code-index
+          KeySchema:
+            - AttributeName: short_code
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub cooksnap-feedback-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: feedback_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: feedback_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-created_at-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "cooksnap-images-${Environment}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldImages
+            Status: Enabled
+            ExpirationInDays: 7
+
+
+  SharesApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "SharesApi-${Environment}"
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: NONE  # 認証なしでリクエストを許可
+      Cors:
+        AllowMethods: "'POST,GET,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Line-Signature,X-Amz-Date,Authorization,X-Api-Key'"
+        AllowOrigin: "'*'"
+      # パブリックアクセスを明示的に許可するために追加
+      EndpointConfiguration: REGIONAL
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Line-Signature'"
+              Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+
+  CooksnapCoreLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub cooksnap-core-${Environment}
+      Description: Cooksnap core business logic
+      ContentUri: layers/cooksnap_core/
+      CompatibleRuntimes:
+        - python3.9
+
+  # Lambda用権限
+  BaseLambdaRole:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Base IAM policy for Cooksnap Lambda functions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ssm:GetParameter'
+            Resource:
+              - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cooksnap/*'
+
+
+  MainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub cooksnap-main-${Environment}
+      CodeUri: functions/main/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          S3_BUCKET_NAME: !Sub "cooksnap-images-${Environment}"
+          USERS_TABLE: !Sub "cooksnap-users-${Environment}"
+          RECIPES_TABLE: !Sub "cooksnap-recipes-${Environment}"
+          SHARES_TABLE: !Sub "cooksnap-shares-${Environment}"
+          FEEDBACK_TABLE: !Sub "cooksnap-feedback-${Environment}"
+          LINE_BOT_ID_PATH: !Sub "/cooksnap/${Environment}/LINE_BOT_ID"
+      Policies:
+        - !Ref BaseLambdaRole
+        - S3CrudPolicy:
+            BucketName: !Ref ImagesBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RecipesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SharesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub "/cooksnap/${Environment}/LINE_BOT_ID"
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: post
+            RestApiId: !Ref SharesApi
+      Layers:
+        - !Ref CooksnapCoreLayer
+
+  # シェア用関数
+  SharesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/shares/
+      Handler: share_handler.lambda_handler
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          RECIPES_TABLE: !Sub "cooksnap-recipes-${Environment}"
+          SHARES_TABLE: !Sub "cooksnap-shares-${Environment}"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RecipesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SharesTable
+      Events:
+        ShareApiEvent:
+          Type: Api
+          Properties:
+            Path: /r/{shortCode}
+            Method: get
+            RestApiId: !Ref SharesApi
+      Layers:
+        - !Ref CooksnapCoreLayer
+
+  # Rich Menu用関数
+  RichMenuFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/main/
+      Handler: richmenu.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          S3_BUCKET_NAME: !Sub "cooksnap-images-${Environment}"
+          FEEDBACK_TABLE: !Sub "cooksnap-feedback-${Environment}"
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'ssm:GetParameter'
+              Resource:
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cooksnap/*'
+        - S3ReadPolicy:
+            BucketName: !Ref ImagesBucket
+      Events:
+        RichMenuApiEvent:
+          Type: Api
+          Properties:
+            Path: /richmenu
+            Method: post
+      Layers:
+        - !Ref CooksnapCoreLayer
+
+  # 利用回数リセット用関数
+  DailyResetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/daily/
+      Handler: batch.reset_daily_usage
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          USERS_TABLE: !Sub "cooksnap-users-${Environment}"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Sub UsersTable
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 0 * * ? *)
+            Description: 日次利用回数リセット処理
+            Enabled: true
+      Layers:
+        - !Ref CooksnapCoreLayer
+
+Outputs:
+  SharesApiUrl:
+    Description: "API Gateway endpoint URL for shares API"
+    Value: !Sub "https://${SharesApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhook"
+
+  # CooksnapFunction:
+  #   Description: "Cooksnap Lambda Function ARN"
+  #   Value: !GetAtt MainFunction.Arn
+  
+  # ImagesBucketName:
+  #   Description: "S3 bucket for storing food images"
+  #   Value: !Ref ImagesBucket
